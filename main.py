@@ -1,19 +1,26 @@
 from fastapi import FastAPI, Request
 import requests
 import os
-import json
-from datetime import datetime
 
 app = FastAPI()
 
-# ENV VARS
+# Environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-NOTION_DB_ID = os.getenv("NOTION_DB_ID")
+AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY")
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
+TABLE_NAME = "Alerts"
+
+AIRTABLE_ENDPOINT = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{TABLE_NAME}"
+
+headers = {
+    "Authorization": f"Bearer {AIRTABLE_API_KEY}",
+    "Content-Type": "application/json"
+}
 
 watchlist = ["Divi’s Labs", "Aurobindo Pharma", "Natco Pharma"]
 
+# Telegram messenger
 def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
@@ -24,128 +31,103 @@ def send_message(text):
     }
     requests.post(url, json=payload)
 
-# 🔍 NOTION QUERY
-def query_notion(filter_by=None, max_results=5):
-    url = f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query"
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json"
+# Query Airtable
+def fetch_records(max_records=5, risk_filter=None):
+    params = {
+        "maxRecords": max_records,
+        "sort[0][field]": "Date",
+        "sort[0][direction]": "desc"
     }
+    if risk_filter:
+        params["filterByFormula"] = f"{{Risk Level}}='{risk_filter}'"
 
-    body = {
-        "page_size": max_results,
-        "sorts": [{"timestamp": "created_time", "direction": "descending"}]
-    }
+    res = requests.get(AIRTABLE_ENDPOINT, headers=headers, params=params)
+    return res.json().get("records", [])
 
-    if filter_by == "risk_high":
-        body["filter"] = {
-            "property": "Risk Level",
-            "select": {
-                "equals": "High"
-            }
-        }
-
-    res = requests.post(url, headers=headers, json=body)
-    data = res.json()
-    return data.get("results", [])
-
-# 🔄 FORMAT ENTRY
 def format_entry(entry):
-    props = entry["properties"]
-    company = props["Company"]["title"][0]["text"]["content"]
-    event = props["Event Type"]["select"]["name"]
-    date = props["Date"]["date"]["start"]
-    risk = props["Risk Level"]["select"]["name"]
-    source = props["Source"]["url"]
-    action = props["Suggested Action"]["rich_text"][0]["text"]["content"]
-    notes = props["SARAH Notes"]["rich_text"][0]["text"]["content"]
-
+    f = entry["fields"]
     return f"""
-🧠 *Latest Alert Logged*
+🧠 *SARAH Alert*
 
-🏢 *Company*: {company}
-📆 *Date*: {date}
-📊 *Event*: {event}
-⚠️ *Risk*: {risk}
-🎯 *Action*: {action}
-🔗 *Source*: [Link]({source})
+🏢 *Company*: {f.get('Company', 'N/A')}
+📆 *Date*: {f.get('Date', 'N/A')}
+📊 *Event*: {f.get('Event Type', 'N/A')}
+⚠️ *Risk Level*: {f.get('Risk Level', 'N/A')}
+🎯 *Suggested Action*: {f.get('Suggested Action', 'N/A')}
+🔗 *Source*: [View]({f.get('Source', '')})
 
-📝 *Notes*: {notes}
+📝 *Notes*: {f.get('SARAH Notes', 'N/A')}
 """.strip()
 
-# 📬 ROUTE
 @app.post("/webhook")
-async def webhook(request: Request):
-    data = await request.json()
+async def telegram_webhook(req: Request):
+    data = await req.json()
     message = data.get("message", {})
     text = message.get("text", "").strip()
-    
+
     if text == "/start":
-        send_message("👋 Hello BOSS! SARAH is online.\nUse /help to see commands.")
-    
+        send_message("👋 Hello BOSS! SARAH is online. Use /help to see all commands.")
     elif text == "/help":
-        send_message("""🧠 *Available Commands*:
+        send_message("""🧠 *SARAH Commands*:
 /start – Restart SARAH
-/help – Show this menu
-/watchlist – Show tracked stocks
-/alerts – (soon)
-/last – Last Notion alert
+/help – List commands
+/watchlist – Tracked stocks
+/last – Last alert from Airtable
 /summary – Last 5 alerts
-/risk high – Show high-risk events
-/nextbuy – Suggest buyable panic drops
-/addstock XYZ – Add new stock to memory
-""")
+/risk high – High-risk events
+/nextbuy – Buy-worthy entries
+/addstock XYZ – Add a stock""")
 
     elif text == "/watchlist":
-        send_message("📋 Tracked Stocks:\n" + "\n".join([f"✅ {w}" for w in watchlist]))
+        send_message("📋 Your Watchlist:\n" + "\n".join(f"✅ {s}" for s in watchlist))
 
     elif text.startswith("/addstock"):
         parts = text.split(" ", 1)
         if len(parts) == 2:
             stock = parts[1].strip()
             watchlist.append(stock)
-            send_message(f"➕ Added *{stock}* to your tracked list.")
+            send_message(f"➕ Added *{stock}* to watchlist.")
         else:
-            send_message("⚠️ Use `/addstock StockName`")
+            send_message("⚠️ Usage: `/addstock StockName`")
 
     elif text == "/last":
-        results = query_notion(max_results=1)
-        if results:
-            send_message(format_entry(results[0]))
+        records = fetch_records(1)
+        if records:
+            send_message(format_entry(records[0]))
         else:
-            send_message("⚠️ No entries found in Notion.")
+            send_message("⚠️ No alerts found in Airtable.")
 
     elif text == "/summary":
-        results = query_notion(max_results=5)
-        if results:
-            for entry in results:
-                send_message(format_entry(entry))
+        records = fetch_records(5)
+        if records:
+            for r in records:
+                send_message(format_entry(r))
         else:
-            send_message("⚠️ No recent alerts found.")
+            send_message("⚠️ No alerts found.")
 
     elif text == "/risk high":
-        results = query_notion(filter_by="risk_high")
-        if results:
-            for entry in results:
-                send_message(format_entry(entry))
+        records = fetch_records(10, risk_filter="High")
+        if records:
+            for r in records:
+                send_message(format_entry(r))
         else:
-            send_message("✅ No high-risk events currently logged.")
+            send_message("✅ No *high-risk* alerts at the moment.")
 
     elif text == "/nextbuy":
-        results = query_notion(max_results=5)
+        records = fetch_records(10)
         found = []
-        for r in results:
-            if "buy" in r["properties"]["Suggested Action"]["rich_text"][0]["text"]["content"].lower():
-                found.append(format_entry(r))
+        for r in records:
+            action = r["fields"].get("Suggested Action", "").lower()
+            if "buy" in action:
+                found.append(r)
         if found:
-            for f in found:
-                send_message(f)
+            for r in found:
+                send_message(format_entry(r))
         else:
-            send_message("📉 No buy-worthy alerts found at the moment.")
+            send_message("📉 No buy-worthy alerts currently.")
 
     return {"ok": True}
 
 @app.get("/")
 def root():
-    return {"message": "SARAH Pharma Bot is Live"}
+    return {"message": "SARAH Airtable Bot is Live"}
